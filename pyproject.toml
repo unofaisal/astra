@@ -1,0 +1,21 @@
+[project]
+name = "astra"
+version = "0.1.0"
+description = "A general-purpose, storage/framework-agnostic agent harness."
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["astra*"]
