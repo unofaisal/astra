@@ -12,15 +12,20 @@ Scope, deliberately:
   - No auth. Every endpoint is open, including /config (which can change
     the API key and provider for the ENTIRE process). Add a real auth
     dependency (see the `current_user` stub below) before exposing this
-    publicly.
-  - Single worker only. `Astra`'s default SignalStore (stop-flags) is
-    in-process — a stop() call only reaches a run happening in the SAME
-    worker process. A Redis-backed SignalStore (same 3-method contract
-    as astra.signals.SignalStore) is the fix for multi-worker/multi-
-    replica deployments — not built this pass.
-  - SQLiteStore by default. Fine for light/moderate concurrent request
-    volume; swap in examples/postgres_store.py's PostgresStore for real
-    concurrent load.
+    publicly. Session ownership IS enforced (enforce_ownership=True): once
+    `current_user` returns real identities, one user cannot read, continue,
+    stop or delete another user's session.
+  - Multi-worker: Stop flags and the per-session run lock are shared across
+    worker processes if you pass a Redis-backed SignalStore
+    (astra.signals_redis.RedisSignalStore) — set ASTRA_REDIS_URL below.
+    Without it, the default in-process store only covers ONE worker.
+  - Two concurrent runs on the same session are rejected with HTTP 409
+    (SessionBusyError) instead of silently corrupting the history.
+  - SQLiteStore (WAL mode) by default. Fine for light/moderate volume;
+    swap in examples/postgres_store.py's PostgresStore (or your own Store)
+    for real multi-process load.
+  - GET /metrics exposes astra_app.stats() (tool/LLM/limiter state,
+    counters, latency histograms). Graceful shutdown drains in-flight runs.
   - /config mutates process-wide settings (provider/model/api key)
     in-place on astra_app.config — this affects EVERY session on this
     process, not just the caller's. There is no per-user configuration
@@ -37,6 +42,8 @@ import json
 import os
 from typing import Any, AsyncIterator, Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -44,6 +51,7 @@ from pydantic import BaseModel
 
 from astra import create_astra
 from astra.events import Callbacks
+from astra.sessions import SessionBusyError, SessionOwnershipError
 from astra.storage import SQLiteStore
 
 from ..model_catalog import MODEL_CHOICES
@@ -52,15 +60,52 @@ from ..model_catalog import MODEL_CHOICES
 
 DEFAULT_USER = "local-user"  # fixed, hardcoded — no auth yet, see module docstring
 
+def _build_signals():
+    """Shared Stop flags / session locks across workers when Redis is configured."""
+    url = os.environ.get("ASTRA_REDIS_URL")
+    if not url:
+        return None  # default in-process store (single worker)
+    from astra.signals_redis import RedisSignalStore
+
+    return RedisSignalStore(url=url, prefix="astra:")
+
+
 astra_app = create_astra(
     provider=os.environ.get("ASTRA_PROVIDER", "openai"),
     api_key=os.environ.get("ASTRA_API_KEY"),
     model=os.environ.get("ASTRA_MODEL", "gpt-4o-mini"),
     store=SQLiteStore(os.environ.get("ASTRA_DB_PATH", "astra_api_sessions.db")),
+    signals=_build_signals(),
     tools_dir="astra/tools",
+    enforce_ownership=True,
 )
 
-app = FastAPI(title="astra REST API", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await astra_app.start()  # connects MCP servers, if any were configured
+    try:
+        yield
+    finally:
+        await astra_app.aclose()  # drain in-flight runs, kill child processes, close clients
+
+
+app = FastAPI(title="astra REST API", version="0.3.0", lifespan=lifespan)
+
+
+@app.exception_handler(SessionBusyError)
+async def _busy_handler(_request, exc: SessionBusyError):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(SessionOwnershipError)
+async def _forbidden_handler(_request, exc: SessionOwnershipError):
+    from fastapi.responses import JSONResponse
+
+    # 404 rather than 403: don't confirm that someone else's session exists.
+    return JSONResponse(status_code=404, content={"detail": "session not found"})
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,50 +201,52 @@ async def chat(req: ChatRequest, user: str = Depends(current_user)) -> ChatRespo
 
 
 @app.post("/chat/resume", response_model=ChatResponse)
-async def resume(req: ResumeRequest) -> ChatResponse:
+async def resume(req: ResumeRequest, user: str = Depends(current_user)) -> ChatResponse:
     """Answer a paused clarification and continue the run."""
     try:
-        result = await astra_app.resume(req.session_id, req.clarification_id, req.answer)
+        result = await astra_app.resume(req.session_id, req.clarification_id, req.answer, user=user)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return _to_response(result)
 
 
 @app.post("/sessions/{session_id}/regenerate", response_model=ChatResponse)
-async def regenerate(session_id: str, req: RegenerateRequest) -> ChatResponse:
+async def regenerate(session_id: str, req: RegenerateRequest, user: str = Depends(current_user)) -> ChatResponse:
     """Discard the most recent assistant turn and run again."""
     try:
-        result = await astra_app.regenerate(session_id, model_override=req.model)
+        result = await astra_app.regenerate(session_id, model_override=req.model, user=user)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return _to_response(result)
 
 
 @app.post("/sessions/{session_id}/stop")
-async def stop(session_id: str) -> dict:
-    """Cooperative stop — checked at the next loop/tool-dispatch boundary
-    inside the run, not an immediate kill. Only affects a run happening
-    on THIS worker process (see module docstring)."""
-    astra_app.stop(session_id)
+async def stop(session_id: str, user: str = Depends(current_user)) -> dict:
+    """Request a stop. An in-flight LLM call or tool is cancelled within
+    ~0.5 s (not only at the next step boundary). Reaches runs on other
+    worker processes if a shared (Redis) SignalStore is configured."""
+    astra_app.stop(session_id, user=user)
     return {"status": "stop requested", "session_id": session_id}
 
 
 @app.get("/sessions/{session_id}")
-async def get_session(session_id: str) -> dict:
-    session = astra_app.get_session(session_id)
+async def get_session(session_id: str, user: str = Depends(current_user)) -> dict:
+    session = astra_app.get_session(session_id, user=user)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session '{session_id}' not found")
     return session.to_dict()
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str) -> dict:
+async def delete_session(session_id: str, user: str = Depends(current_user)) -> dict:
+    astra_app.get_session(session_id, user=user)  # ownership check (raises -> 404)
     astra_app.store.delete(session_id)
     return {"status": "deleted", "session_id": session_id}
 
 
 @app.get("/sessions")
-async def list_sessions(user: Optional[str] = None, limit: int = 50, offset: int = 0) -> list[dict]:
+async def list_sessions(limit: int = 50, offset: int = 0, user: str = Depends(current_user)) -> list[dict]:
+    # Always scoped to the caller — never list other users' sessions.
     sessions = astra_app.list_sessions(user=user, limit=limit, offset=offset)
     return [s.to_dict() for s in sessions]
 
@@ -249,6 +296,13 @@ async def update_config(req: ConfigUpdateRequest) -> ConfigResponse:
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> dict:
+    """Operational snapshot: active runs, tool/LLM limiter state, circuit
+    breakers, MCP status, counters and latency histograms."""
+    return astra_app.stats()
 
 
 # ── Streaming endpoint (SSE) ───────────────────────────────────────
@@ -311,6 +365,8 @@ async def _run_streamed(coro_factory, queue: asyncio.Queue, fallback_session_id:
     try:
         result = await coro_factory()
         await queue.put(_sse("result", _to_response(result).model_dump()))
+    except SessionBusyError as exc:
+        await queue.put(_sse("result", {"status": "busy", "error": str(exc), "session_id": fallback_session_id}))
     except Exception as exc:
         await queue.put(_sse("result", {"status": "error", "error": str(exc), "session_id": fallback_session_id}))
     finally:
@@ -356,25 +412,25 @@ async def chat_stream(req: ChatRequest, user: str = Depends(current_user)) -> St
 
 
 @app.post("/sessions/{session_id}/regenerate/stream")
-async def regenerate_stream(session_id: str, req: RegenerateRequest) -> StreamingResponse:
+async def regenerate_stream(session_id: str, req: RegenerateRequest, user: str = Depends(current_user)) -> StreamingResponse:
     queue: asyncio.Queue = asyncio.Queue()
     callbacks = _stream_callbacks(queue)
 
     async def run():
-        return await astra_app.regenerate(session_id, model_override=req.model, callbacks=callbacks)
+        return await astra_app.regenerate(session_id, model_override=req.model, callbacks=callbacks, user=user)
 
     task = asyncio.create_task(_run_streamed(run, queue, session_id))
     return StreamingResponse(_drain(queue, task), media_type="text/event-stream")
 
 
 @app.post("/chat/resume/stream")
-async def resume_stream(req: ResumeRequest) -> StreamingResponse:
+async def resume_stream(req: ResumeRequest, user: str = Depends(current_user)) -> StreamingResponse:
     """Streaming variant of /chat/resume — same event shape as /chat/stream."""
     queue: asyncio.Queue = asyncio.Queue()
     callbacks = _stream_callbacks(queue)
 
     async def run():
-        return await astra_app.resume(req.session_id, req.clarification_id, req.answer, callbacks=callbacks)
+        return await astra_app.resume(req.session_id, req.clarification_id, req.answer, callbacks=callbacks, user=user)
 
     task = asyncio.create_task(_run_streamed(run, queue, req.session_id))
     return StreamingResponse(_drain(queue, task), media_type="text/event-stream")

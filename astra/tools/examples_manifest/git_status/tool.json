@@ -1,0 +1,22 @@
+{
+  "name": "git_status",
+  "description": "Show the working-tree status of a git repository (git status --short).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "x-astra-path": true,
+        "description": "Repository directory, relative to the workspace. Defaults to the workspace root."
+      }
+    }
+  },
+  "exec": {
+    "command": ["git", "-C", "{path?}", "status", "--short"],
+    "timeout": 15,
+    "output": "text",
+    "ok_exit_codes": [0]
+  },
+  "annotations": { "read_only": true, "idempotent": true },
+  "requires": ["git"]
+}

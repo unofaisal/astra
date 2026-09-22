@@ -17,8 +17,13 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Any, Protocol
+
+
+class ConcurrentModificationError(RuntimeError):
+    """Raised by a Store that detects a lost-update: the persisted session
+    changed since this copy was loaded (another worker/tab wrote to it)."""
 
 
 def gen_id(prefix: str = "") -> str:
@@ -99,6 +104,20 @@ class Session:
     delegated_skill: str | None = None
     delegate_depth: int = 0
 
+    # multi-tenancy / concurrency
+    tenant: str | None = None
+    version: int = 0  # bumped on every checkpoint; stores may use it for optimistic concurrency
+
+    # context management (see astra.context)
+    context_summary: str | None = None  # rolling summary of messages up to `summary_upto`
+    summary_upto: str | None = None  # message_id of the last summarized message
+    loaded_tools: list[str] = field(default_factory=list)  # deferred tools discovered via search_tools
+
+    # usage rolled up from delegated sub-agents (already counted in their own sessions)
+    delegated_input_tokens: int = 0
+    delegated_output_tokens: int = 0
+    delegated_cost: float = 0.0
+
     skill_invoked: str | None = None
     skill_content_hash: str | None = None
 
@@ -110,10 +129,15 @@ class Session:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Session":
+        # Tolerant of unknown keys so data written by a newer astra can still
+        # be read by an older one (and vice-versa: new fields have defaults).
         data = dict(data)
-        data["messages"] = [MessageRow(**m) for m in data.get("messages", [])]
-        data["tool_calls"] = [ToolCallRow(**t) for t in data.get("tool_calls", [])]
-        return cls(**data)
+        m_fields = {f.name for f in fields(MessageRow)}
+        t_fields = {f.name for f in fields(ToolCallRow)}
+        s_fields = {f.name for f in fields(cls)}
+        data["messages"] = [MessageRow(**{k: v for k, v in m.items() if k in m_fields}) for m in data.get("messages", [])]
+        data["tool_calls"] = [ToolCallRow(**{k: v for k, v in t.items() if k in t_fields}) for t in data.get("tool_calls", [])]
+        return cls(**{k: v for k, v in data.items() if k in s_fields})
 
 
 # ── Store protocol ─────────────────────────────────────────────────
