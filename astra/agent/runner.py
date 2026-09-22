@@ -13,10 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..config import AgentConfig
-from ..context import ContextManager, ContextPolicy
 from ..events import Callbacks
 from ..providers.openai_api import OpenAIProvider
-from ..sessions import check_owner
 from ..signals import SignalStore
 from ..storage import Store
 from ..tools.decorator import ToolRegistry
@@ -50,8 +48,6 @@ def new_conversation(
     attachments_builder=None,
     provenance: Provenance | None = None,
     agent_name: str | None = None,
-    tenant: str | None = None,
-    enforce_owner: bool = False,
 ) -> Conversation:
     conv = Conversation(
         store=store,
@@ -61,8 +57,6 @@ def new_conversation(
         callbacks=callbacks,
         pricing_lookup=pricing_lookup,
         attachments_builder=attachments_builder,
-        tenant=tenant,
-        enforce_owner=enforce_owner,
     )
     if provenance:
         conv.session.trigger_type = provenance.trigger_type
@@ -86,53 +80,24 @@ def build_agent(
     reasoning_effort_override: str | None = None,
     max_turns: int | None = None,
     max_context_turns: int | None = None,
-    provider: Any = None,
-    pool: Any = None,
-    runtime: Any = None,
-    policy: Any = None,
-    context_manager: ContextManager | None = None,
-    quota: Any = None,
-    run_timeout: float | None = None,
-    max_parallel_tool_calls: int = 8,
-    stop_poll_interval: float = 0.5,
 ) -> Agent:
     """Wire a Conversation + ToolRegistry + AgentConfig into a ready-to-run
     Agent. Split out from run_turn() so a caller who wants to hold onto
     the Agent (e.g. to call conversation.request_stop() from another
-    coroutine while a long run is in flight) can do so.
-
-    New optional arguments (all backward compatible):
-      provider  — a ready provider (skips constructing one; tests/custom LLMs)
-      pool      — ProviderPool sharing HTTP clients/gates (default: process-wide)
-      runtime   — shared ToolRuntime (limits, sandbox runner)
-      policy    — tool allow/deny hook
-      context_manager — defaults to ContextManager(max_chars=config.max_context_chars)
-      quota / run_timeout / max_parallel_tool_calls / stop_poll_interval
-    """
-    if provider is None:
-        provider = OpenAIProvider(
-            config,
-            model_override=model_override,
-            reasoning_effort_override=reasoning_effort_override,
-            pool=pool,
-        )
+    coroutine while a long run is in flight) can do so."""
+    provider = OpenAIProvider(
+        config,
+        model_override=model_override,
+        reasoning_effort_override=reasoning_effort_override,
+    )
     if system_prompt is not None:
         conversation.set_system(system_prompt)
-    if context_manager is None:
-        context_manager = ContextManager(ContextPolicy(max_chars=config.max_context_chars))
     return Agent(
         conversation=conversation,
         provider=provider,
         registry=registry,
         max_turns=max_turns or config.max_turns,
         max_context_turns=max_context_turns,
-        runtime=runtime,
-        policy=policy,
-        context_manager=context_manager,
-        quota=quota,
-        run_timeout=run_timeout,
-        max_parallel_tool_calls=max_parallel_tool_calls,
-        stop_poll_interval=stop_poll_interval,
     )
 
 
@@ -148,11 +113,9 @@ async def run_turn(
     reasoning_effort_override: str | None = None,
     max_turns: int | None = None,
     max_context_turns: int | None = None,
-    **agent_options: Any,
 ) -> AgentResult:
     """The common case, in one call: add the user's message, run the
     agent loop to completion (or a pause/stop/error), return the result.
-    ``agent_options`` are forwarded to build_agent (runtime, pool, quota, …).
     """
     agent = build_agent(
         conversation,
@@ -163,7 +126,6 @@ async def run_turn(
         reasoning_effort_override=reasoning_effort_override,
         max_turns=max_turns,
         max_context_turns=max_context_turns,
-        **agent_options,
     )
     await conversation.add_user_message(user_message, attachments=attachments)
     return await agent.run()
@@ -183,17 +145,9 @@ async def resume_after_clarification(
     attachments_builder=None,
     system_prompt: str | None = None,
     max_turns: int | None = None,
-    user: str | None = None,
-    tenant: str | None = None,
-    enforce_owner: bool = False,
-    **agent_options: Any,
 ) -> AgentResult:
     """Answer a paused clarification and continue the run from where it
     left off."""
-    if enforce_owner:
-        existing = store.get(session_id)
-        if existing is not None:
-            check_owner(existing.user, user, session_id)
     result = await Conversation.resolve_clarification(store, session_id, clarification_id, answer)
     if not result.get("found"):
         raise ValueError(f"No pending clarification '{clarification_id}' found in session '{session_id}'.")
@@ -206,7 +160,7 @@ async def resume_after_clarification(
         pricing_lookup=pricing_lookup,
         attachments_builder=attachments_builder,
     )
-    agent = build_agent(conversation, registry, config, system_prompt=system_prompt, max_turns=max_turns, **agent_options)
+    agent = build_agent(conversation, registry, config, system_prompt=system_prompt, max_turns=max_turns)
     return await agent.run()
 
 
@@ -220,20 +174,14 @@ async def recover_interrupted_session(
     callbacks: Callbacks | None = None,
     system_prompt: str | None = None,
     max_turns: int | None = None,
-    user: str | None = None,
-    enforce_owner: bool = False,
-    **agent_options: Any,
 ) -> AgentResult | None:
     """If a session was left with dangling pending tool calls (process
     crash mid-run), synthesize error results for them so history stays
     valid, then continue the loop. Returns None if there was nothing to
     recover."""
-    conversation = Conversation(
-        store=store, session_id=session_id, signals=signals, callbacks=callbacks,
-        user=user or "anonymous", enforce_owner=enforce_owner,
-    )
+    conversation = Conversation(store=store, session_id=session_id, signals=signals, callbacks=callbacks)
     if not conversation.can_retry_from_last_state():
         return None
     await conversation.inject_recovery_tool_results()
-    agent = build_agent(conversation, registry, config, system_prompt=system_prompt, max_turns=max_turns, **agent_options)
+    agent = build_agent(conversation, registry, config, system_prompt=system_prompt, max_turns=max_turns)
     return await agent.run()

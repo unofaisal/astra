@@ -38,7 +38,6 @@ from ..signals import (
     is_stop_requested,
     request_stop,
 )
-from ..sessions import SessionOwnershipError, check_owner
 from ..storage import MemoryStore, MessageRow, Session, Store, ToolCallRow, gen_id
 
 logger = logging.getLogger(__name__)
@@ -50,11 +49,6 @@ current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar("curren
 
 # Same propagation mechanism, for delegate_task's depth limiting.
 current_delegate_depth: contextvars.ContextVar[int] = contextvars.ContextVar("current_delegate_depth", default=0)
-
-# Who the running agent acts for — lets tools run *as the calling user*
-# (authorization, per-tenant limits) without reaching back into the store.
-current_user: contextvars.ContextVar[str] = contextvars.ContextVar("current_user", default="")
-current_tenant: contextvars.ContextVar[str] = contextvars.ContextVar("current_tenant", default="")
 
 
 class StoppedByUser(Exception):
@@ -159,8 +153,6 @@ class Conversation:
         callbacks: Callbacks | None = None,
         pricing_lookup: PricingLookup = None,
         attachments_builder: AttachmentsBuilder = None,
-        tenant: str | None = None,
-        enforce_owner: bool = False,
     ):
         self.store = store or MemoryStore()
         self.signals = signals
@@ -169,14 +161,7 @@ class Conversation:
         self.attachments_builder = attachments_builder
 
         existing = self.store.get(session_id) if session_id else None
-        if existing is not None and enforce_owner:
-            # Opt-in strict mode: the ``user`` argument must own the session.
-            # (Without it, an existing session's stored owner silently wins
-            # and any caller who knows a session_id can continue it.)
-            check_owner(existing.user, user, session_id or "")
-            if existing.tenant and tenant and existing.tenant != tenant:
-                raise SessionOwnershipError(f"Session {session_id} is not accessible to this tenant.")
-        self.session: Session = existing or Session(session_id=session_id or gen_id("sess_"), user=user, tenant=tenant)
+        self.session: Session = existing or Session(session_id=session_id or gen_id("sess_"), user=user)
 
         self.session_id = self.session.session_id
         self.system_prompt: str | None = None
@@ -240,21 +225,6 @@ class Conversation:
         pending_reasoning: list[str] = []
         all_rows = list(self.session.messages)
 
-        # Rolling summary (astra.context): older rows were folded into
-        # session.context_summary — skip them and replay the summary once.
-        if self.session.context_summary and self.session.summary_upto:
-            for i, r in enumerate(all_rows):
-                if r.message_id == self.session.summary_upto:
-                    all_rows = all_rows[i + 1 :]
-                    break
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Summary of the earlier conversation (older messages were condensed to save context):\n"
-                    + self.session.context_summary,
-                }
-            )
-
         if max_turns is not None:
             assistant_indices = [i for i, r in enumerate(all_rows) if r.role == "assistant"]
             if len(assistant_indices) > max_turns:
@@ -313,8 +283,7 @@ class Conversation:
                     else:
                         result_content = (
                             "Error: tool execution was interrupted and no result was recorded. "
-                            "The tool may or may not have completed — if it has side effects, "
-                            "check the current state before retrying."
+                            "Please retry the operation if needed."
                         )
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "name": tc.tool_name, "content": result_content}
@@ -352,12 +321,7 @@ class Conversation:
         self.session.last_active = time.time()
         self.session.message_count = len(self.session.messages)
         self.session.tool_call_count = len(self.session.tool_calls)
-        self.session.version += 1  # optimistic-concurrency token (see SQLiteStore)
-        try:
-            self.store.save(self.session)
-        except BaseException:
-            self.session.version -= 1
-            raise
+        self.store.save(self.session)
 
     def add_system_message(self, text: str, skill_name: str | None = None) -> None:
         """Insert a system message inline (not the top-level system_prompt
@@ -649,27 +613,6 @@ class Conversation:
             self._checkpoint()
         return count
 
-    # ── Usage helpers ────────────────────────────────────
-
-    def last_prompt_tokens(self) -> int:
-        """Provider-reported prompt size of the most recent assistant turn."""
-        for m in reversed(self.session.messages):
-            if m.role == "assistant" and m.input_tokens:
-                return m.input_tokens
-        return 0
-
-    def add_side_usage(self, message_obj: dict[str, Any]) -> None:
-        """Account tokens/cost of an out-of-band LLM call (e.g. context
-        summarization) without adding a transcript row."""
-        usage = (message_obj or {}).get("usage") or {}
-        i = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-        o = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-        self.session.total_input_tokens += i
-        self.session.total_output_tokens += o
-        cost = _compute_cost(self.pricing_lookup, (message_obj or {}).get("model"), i, o, 0)
-        if cost:
-            self.session.estimated_cost += cost
-
     # ── Persistence ──────────────────────────────────────
 
     def save(self, ended_reason: str | None = None) -> None:
@@ -727,25 +670,33 @@ class Conversation:
         return count
 
     def truncate_last_assistant_turn(self) -> bool:
-        """Remove the most recent assistant turn — and any tool_calls or
-        reasoning rows tied to it — so the conversation ends right after
-        the preceding user message, ready to be regenerated by calling
-        Agent.run() again (no new user message needed; the model just
-        sees history ending on a user turn, same as any normal call).
+        """Remove the most recent *response* — which may span more than
+        one assistant MessageRow, since a single agentic exchange can
+        involve several internal LLM calls interleaved with tool calls
+        (each one gets its own row — see Agent._run_one_turn calling
+        add_assistant_message on every loop iteration). Removing only
+        the single last row would orphan earlier rounds of the same
+        response, leaving them stitched to the newly regenerated one.
+        So this walks back through the whole trailing run of
+        assistant/reasoning rows and removes all of it, stopping at the
+        preceding user (or system) message — ready to be regenerated by
+        calling Agent.run() again from there.
 
-        Returns False if there's no assistant turn to remove (empty
-        conversation, or it already ends on a user message).
+        Returns False if there's nothing to remove (empty conversation,
+        or it already ends on a user/system message).
         """
-        last_assistant_idx = None
-        for i in range(len(self.session.messages) - 1, -1, -1):
-            if self.session.messages[i].role == "assistant":
-                last_assistant_idx = i
-                break
-        if last_assistant_idx is None:
+        if not self.session.messages or self.session.messages[-1].role not in ("assistant", "reasoning"):
             return False
 
-        removed_message_ids = {m.message_id for m in self.session.messages[last_assistant_idx:]}
-        self.session.messages = self.session.messages[:last_assistant_idx]
+        cut_idx = len(self.session.messages)
+        for i in range(len(self.session.messages) - 1, -1, -1):
+            if self.session.messages[i].role in ("assistant", "reasoning"):
+                cut_idx = i
+            else:
+                break
+
+        removed_message_ids = {m.message_id for m in self.session.messages[cut_idx:]}
+        self.session.messages = self.session.messages[:cut_idx]
         self.session.tool_calls = [
             tc for tc in self.session.tool_calls if tc.parent_message not in removed_message_ids
         ]

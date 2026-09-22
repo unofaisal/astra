@@ -6,8 +6,6 @@ from .conversation import (
     StoppedByUser,
     current_delegate_depth,
     current_session_id,
-    current_tenant,
-    current_user,
 )
 from .runner import (
     Provenance,
@@ -26,8 +24,6 @@ __all__ = [
     "ClarificationPending",
     "StoppedByUser",
     "current_session_id",
-    "current_user",
-    "current_tenant",
     "current_delegate_depth",
     "Provenance",
     "new_conversation",

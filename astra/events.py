@@ -42,7 +42,6 @@ class Callbacks:
     on_message: Hook = None  # (role: str, content: str, **extra)
     on_tool_start: Hook = None  # (call_id, tool_name, args)
     on_tool_result: Hook = None  # (call_id, tool_name, result|error, elapsed_ms, is_error)
-    on_tool_output: Hook = None  # (session_id, call_id, stream, data) — live stdout/stderr of process tools
     on_clarification_request: Hook = None  # (session_id, clarification_id, question, options, allow_free_text)
     on_done: Hook = None  # (session_id, response)
     on_error: Hook = None  # (session_id, error_text)

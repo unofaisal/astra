@@ -50,17 +50,6 @@ class AgentConfig:
     supports_vision: bool = False
     pdf_engine: str = "mistral-ocr"  # only meaningful for provider == "openrouter"
 
-    # ── LLM transport / resilience (astra owns retries: the SDK's own are off) ──
-    request_timeout: float = 300.0  # read/write timeout per request (seconds)
-    connect_timeout: float = 10.0
-    sdk_max_retries: int = 0  # keep 0: astra's retry loop below honours Retry-After and budgets
-    max_backoff: float = 30.0  # cap for exponential backoff / Retry-After
-    honor_retry_after: bool = True
-    llm_max_concurrency: int | None = None  # cap concurrent requests per endpoint+key (None = unlimited)
-    llm_queue_timeout: float = 30.0  # max wait for a concurrency slot
-    llm_breaker_threshold: int = 8  # consecutive transient failures before the circuit opens
-    llm_breaker_cooldown: float = 20.0
-
     @classmethod
     def from_env(cls, prefix: str = "ASTRA_") -> "AgentConfig":
         return cls(

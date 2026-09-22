@@ -16,7 +16,7 @@ Core building blocks:
   - astra.agent          — Conversation (session/history) + Agent (turn loop)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 from .client import Astra, AstraSettings, create_astra  # noqa: E402
 

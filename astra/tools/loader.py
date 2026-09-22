@@ -29,56 +29,34 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from .core import Tool
 from .decorator import ToolRegistry
-from .manifest import discover_manifest_tools, find_manifest_files
 
 logger = logging.getLogger(__name__)
 
 
-def load_tools(registry: ToolRegistry, tools_dir: str | Path, *, manifests: bool = True) -> None:
-    """Load every tool group under ``tools_dir``.
-
-    A group is a subdirectory holding Python tools (``schema.py`` + ``*.py``
-    with ``@tool`` functions and/or module-level ``Tool`` objects) and/or
-    declarative CLI manifests (``tool.json`` / ``*.tool.json``).  Directory
-    and file iteration is SORTED so the tool order — and therefore the
-    prompt prefix providers cache — is identical across hosts and restarts.
-    """
+def load_tools(registry: ToolRegistry, tools_dir: str | Path) -> None:
     base = Path(tools_dir)
 
-    for tool_group_dir in sorted(p for p in base.iterdir()):
-        if not tool_group_dir.is_dir() or tool_group_dir.name.startswith(("_", ".")):
+    for tool_group_dir in base.iterdir():
+        if not tool_group_dir.is_dir() or tool_group_dir.name.startswith("_"):
             continue
 
-        schema_file = tool_group_dir / "schema.py"
-        has_manifests = manifests and bool(find_manifest_files(tool_group_dir))
-        py_files = sorted(f for f in tool_group_dir.glob("*.py") if not f.name.startswith("_") and f.name != "schema.py")
-
         # 1. Load schemas first
+        schema_file = tool_group_dir / "schema.py"
         if schema_file.exists():
             module = _load_module(schema_file, "schema")
             if module is not None:
                 _register_schemas(module, schema_file, registry)
-        elif not has_manifests and not py_files:
+        else:
             logger.warning(f"Skipping {tool_group_dir.name}: missing schema.py")
-            continue
-        elif not has_manifests:
-            logger.warning(f"{tool_group_dir.name}: no schema.py — only self-describing Tool objects will register")
 
         # 2. Load and wire implementations
-        for py_file in py_files:
+        for py_file in tool_group_dir.glob("*.py"):
+            if py_file.name.startswith("_") or py_file.name == "schema.py":
+                continue
             module = _load_module(py_file, py_file.stem)
             if module is not None:
                 _register_implementations(module, py_file, registry)
-
-        # 3. Declarative CLI manifests
-        if has_manifests:
-            tools, errors = discover_manifest_tools(tool_group_dir)
-            registry.load_errors.extend(errors)
-            names = registry.extend(tools, replace=True)
-            if names:
-                logger.info(f"Loaded {len(names)} manifest tool(s) from {tool_group_dir.name}/")
 
 
 def _dotted_name_if_real_package(py_file: Path) -> str | None:
@@ -155,25 +133,17 @@ def _register_schemas(module: ModuleType, schema_file: Path, registry: ToolRegis
         if isinstance(val, dict) and "name" in val and "parameters" in val
     }
     if schemas:
-        registry.load_schemas(schemas, toolset=schema_file.parent.name)
+        registry.load_schemas(schemas)
         logger.info(f"Loaded {len(schemas)} schemas from {schema_file.parent.name}/schema.py")
     return list(schemas.keys())
 
 
 def _register_implementations(module: ModuleType, py_file: Path, registry: ToolRegistry) -> None:
-    """Finds @tool decorated functions (wired to their pre-registered
-    schemas) and self-describing ``Tool`` objects in an already-loaded
-    module."""
-    for attr_name in sorted(dir(module)):
+    """Finds @tool decorated functions in an already-loaded module and
+    wires them to their pre-registered schemas."""
+    for attr_name in dir(module):
         obj = getattr(module, attr_name)
-        if isinstance(obj, Tool):
-            if obj.name not in registry.tools or registry.tools[obj.name] is not obj:
-                try:
-                    registry.register(obj, replace=True)
-                    logger.debug(f"Registered Tool '{obj.name}' from {py_file.name}")
-                except Exception as exc:
-                    logger.error(f"Failed to register {attr_name}: {exc}")
-        elif callable(obj) and getattr(obj, "__is_tool__", False):
+        if callable(obj) and getattr(obj, "__is_tool__", False):
             try:
                 registry.register_tool(obj)
                 logger.debug(f"Wired executor '{obj.__schema_name__}' from {py_file.name}")

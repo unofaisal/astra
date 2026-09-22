@@ -31,11 +31,6 @@ class SignalStore(Protocol):
 
     def delete(self, key: str) -> None: ...
 
-    # OPTIONAL: an atomic "set if absent" (Redis: SET key value NX EX ttl).
-    # When a store provides it, astra uses it for a cross-process session
-    # lock; without it the session lock is per-process only.
-    # def set_if_absent(self, key: str, value: str, ttl_seconds: float | None = None) -> bool: ...
-
 
 class InMemorySignalStore:
     """Default SignalStore: an in-process dict guarded by a lock, with
@@ -65,18 +60,6 @@ class InMemorySignalStore:
     def delete(self, key: str) -> None:
         with self._lock:
             self._data.pop(key, None)
-
-    def set_if_absent(self, key: str, value: str, ttl_seconds: float | None = None) -> bool:
-        """Atomic create-if-missing (expired entries count as missing)."""
-        with self._lock:
-            entry = self._data.get(key)
-            if entry is not None:
-                _, expires_at = entry
-                if expires_at is None or time.monotonic() <= expires_at:
-                    return False
-            expires = time.monotonic() + ttl_seconds if ttl_seconds else None
-            self._data[key] = (value, expires)
-            return True
 
 
 # ── Stop-flag helpers (thin convenience wrappers over SignalStore) ──
