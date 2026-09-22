@@ -21,15 +21,20 @@ of frappe.log_error.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
+import time
 from collections.abc import Callable
 from typing import Any, Optional
 
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
 from ..agent_types.messages import Message, MessageList
+from ..concurrency import LimiterBusy
 from ..config import AgentConfig
+from ..telemetry import metrics
+from .pool import ProviderPool, ProviderUnavailable, get_default_pool
 from .registry import Provider, get_provider
 
 logger = logging.getLogger(__name__)
@@ -54,6 +59,15 @@ TokenCallback = Optional[Callable[[str], Any]]
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+
+
+def _retry_after(exc: Exception) -> float | None:
+    """Seconds from a Retry-After header (numeric form), if present."""
+    try:
+        raw = exc.response.headers.get("retry-after")  # type: ignore[attr-defined]
+        return float(raw) if raw is not None else None
+    except Exception:
+        return None
 
 
 def _standardize_message(raw_dict: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -91,8 +105,13 @@ class OpenAIProvider:
         config: AgentConfig,
         model_override: str | None = None,
         reasoning_effort_override: str | None = None,
+        *,
+        pool: ProviderPool | None = None,
+        client: AsyncOpenAI | None = None,
     ) -> None:
         """
+        pool: ProviderPool sharing HTTP clients/gates across agents (default:
+            the process-wide pool).  client: inject a ready client (tests).
         config: the caller's AgentConfig (provider/model/api key/etc).
         model_override: model id to use instead of config.model. Provider
             is still always the one in config.credentials.provider — a
@@ -115,7 +134,10 @@ class OpenAIProvider:
         self.pdf_engine: str = (config.pdf_engine or "mistral-ocr").strip().lower()
 
         base_url = config.credentials.base_url_override or provider.base_url
-        self.client = AsyncOpenAI(api_key=config.credentials.api_key, base_url=base_url)
+        self.config = config
+        pool = pool or get_default_pool()
+        self.client = client or pool.client_for(config, base_url, provider.name)
+        self.gate = pool.gate_for(config, base_url, provider.name)
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -144,34 +166,88 @@ class OpenAIProvider:
         either way — streaming is a side channel for live UI updates only.
         """
         kwargs = self._build_request_kwargs(messages, tools)
+        cfg = self.config
+        max_attempts = max(1, int(cfg.max_retries) + 1)
+        gate = self.gate
 
-        last_exc: Exception | None = None
-        for attempt in range(_MAX_RETRIES):
-            try:
-                is_streaming = on_token is not None or on_reasoning is not None
-                if is_streaming:
-                    return await self._generate_streaming(kwargs, on_token, on_reasoning)
-                return await self._generate_once(kwargs)
+        if not gate.breaker.allow():
+            metrics.inc("astra_llm_calls_total", model=self.model, status="circuit_open")
+            raise ProviderUnavailable(gate.breaker.retry_after())
 
-            except APIStatusError as exc:
-                if exc.status_code in _PERMANENT_STATUS:
-                    logger.error("Permanent provider error %s — not retrying: %s", exc.status_code, exc.message)
-                    raise
-                last_exc = exc
-                logger.warning(
-                    "Transient provider error %s (attempt %d/%d): %s",
-                    exc.status_code, attempt + 1, _MAX_RETRIES, exc.message,
-                )
+        # Once tokens have reached the caller, a retry would replay them
+        # (duplicated text in the UI) — so only retry before first output.
+        emitted = {"any": False}
 
-            except APIConnectionError as exc:
-                last_exc = exc
-                logger.warning("Provider connection error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
+        def _wrap(cb: TokenCallback) -> TokenCallback:
+            if cb is None:
+                return None
 
-            if attempt < _MAX_RETRIES - 1:
-                delay = _BASE_BACKOFF * (2**attempt) + random.uniform(0, 0.5)
-                await asyncio.sleep(delay)
+            async def inner(delta: Any) -> None:
+                emitted["any"] = True
+                r = cb(delta)
+                if asyncio.iscoroutine(r):
+                    await r
 
-        raise RuntimeError(f"Provider failed after {_MAX_RETRIES} attempts.") from last_exc
+            return inner
+
+        w_token, w_reason = _wrap(on_token), _wrap(on_reasoning)
+        is_streaming = on_token is not None or on_reasoning is not None
+
+        slot = contextlib.AsyncExitStack()
+        try:
+            if gate.limiter is not None:
+                try:
+                    await slot.enter_async_context(gate.limiter.slot(gate.queue_timeout))
+                except LimiterBusy as exc:
+                    metrics.inc("astra_llm_calls_total", model=self.model, status="busy")
+                    raise ProviderUnavailable(1.0) from exc
+
+            t0 = time.perf_counter()
+            last_exc: Exception | None = None
+            for attempt in range(max_attempts):
+                retry_after: float | None = None
+                try:
+                    if is_streaming:
+                        result = await self._generate_streaming(kwargs, w_token, w_reason)
+                    else:
+                        result = await self._generate_once(kwargs)
+                    gate.breaker.record_success()
+                    metrics.inc("astra_llm_calls_total", model=self.model, status="ok")
+                    metrics.observe("astra_llm_duration_seconds", time.perf_counter() - t0, model=self.model)
+                    return result
+
+                except APIStatusError as exc:
+                    if exc.status_code in _PERMANENT_STATUS:
+                        logger.error("Permanent provider error %s — not retrying: %s", exc.status_code, exc.message)
+                        metrics.inc("astra_llm_calls_total", model=self.model, status=f"http_{exc.status_code}")
+                        raise
+                    last_exc = exc
+                    if cfg.honor_retry_after:
+                        retry_after = _retry_after(exc)
+                    logger.warning(
+                        "Transient provider error %s (attempt %d/%d): %s",
+                        exc.status_code, attempt + 1, max_attempts, exc.message,
+                    )
+
+                except APIConnectionError as exc:
+                    last_exc = exc
+                    logger.warning("Provider connection error (attempt %d/%d): %s", attempt + 1, max_attempts, exc)
+
+                if emitted["any"]:
+                    logger.warning("Provider failed after streaming began — not retrying (would duplicate output).")
+                    break
+                if attempt < max_attempts - 1:
+                    delay = min(cfg.max_backoff, _BASE_BACKOFF * (2**attempt) + random.uniform(0, 0.5))
+                    if retry_after is not None:
+                        delay = min(cfg.max_backoff, max(delay, retry_after))
+                    metrics.inc("astra_llm_retries_total", model=self.model)
+                    await asyncio.sleep(delay)
+
+            gate.breaker.record_failure()
+            metrics.inc("astra_llm_calls_total", model=self.model, status="failed")
+            raise RuntimeError(f"Provider failed after {max_attempts} attempts.") from last_exc
+        finally:
+            await slot.aclose()
 
     # ── Request construction ───────────────────────────────────────
 

@@ -235,3 +235,181 @@ async def test_delegate_depth_limit_enforced(monkeypatch):
 
     walk(conv.session_id)
     assert found_depth_limit_error, "expected delegate chain to hit MAX_DELEGATE_DEPTH somewhere"
+
+
+# ── New capabilities: tool allow-list, fan-out caps, background mode ──
+
+
+@dataclass
+class ScopedAgentSpec:
+    content: str
+    is_agent: bool = True
+    is_enabled: bool = True
+    tools: list | None = None
+    disallowed_tools: list | None = None
+    max_turns: int | None = None
+    timeout_seconds: float | None = None
+
+
+async def test_delegate_child_gets_restricted_toolset(monkeypatch):
+    from astra.tools.core import Tool
+
+    store = MemoryStore()
+    registry = delegate_registry()
+
+    seen_tool_names = {}
+
+    async def probe(args, ctx):
+        return "ok"
+
+    registry.register(Tool(name="secret_tool", description="d", parameters={"type": "object", "properties": {}}, handler=probe))
+    registry.register(Tool(name="public_tool", description="d", parameters={"type": "object", "properties": {}}, handler=probe))
+
+    config = AgentConfig(credentials=ProviderCredentials(provider="openai", api_key="fake"))
+    agents = {"scoped-bot": ScopedAgentSpec(content="scoped", tools=["public_tool"])}
+
+    configure_delegate(DelegateContext(resolve_agent=lambda n: agents.get(n), store=store, config=config, registry=registry))
+
+    from astra.providers.openai_api import OpenAIProvider
+
+    async def sub_agent_generate(self, messages, tools=None, on_token=None, on_reasoning=None):
+        seen_tool_names["tools"] = {t["function"]["name"] for t in (tools or [])}
+        return {"role": "assistant", "content": "done", "model": "fake"}, None
+
+    monkeypatch.setattr(OpenAIProvider, "generate", sub_agent_generate)
+
+    parent_provider = FakeProvider([tool_turn(("c1", "delegate_task", {"agent_name": "scoped-bot", "task": "x"})), text_turn("ok")])
+    conv = Conversation(store=store, user="alice")
+    agent = Agent(conversation=conv, provider=parent_provider, registry=registry)
+    await conv.add_user_message("go")
+    result = await agent.run()
+
+    assert result.status == "done"
+    assert "public_tool" in seen_tool_names["tools"]
+    assert "secret_tool" not in seen_tool_names["tools"]
+
+
+async def test_delegate_task_reports_unknown_agent():
+    store = MemoryStore()
+    registry = delegate_registry()
+    config = AgentConfig(credentials=ProviderCredentials(provider="openai", api_key="fake"))
+    configure_delegate(DelegateContext(resolve_agent=lambda n: None, store=store, config=config, registry=registry))
+
+    parent_provider = FakeProvider([tool_turn(("c1", "delegate_task", {"agent_name": "ghost", "task": "x"})), text_turn("ok")])
+    conv = Conversation(store=store, user="alice")
+    agent = Agent(conversation=conv, provider=parent_provider, registry=registry)
+    await conv.add_user_message("go")
+    result = await agent.run()
+    assert result.status == "done"
+    tc = conv.session.tool_calls[0]
+    payload = json.loads(tc.result or tc.error)
+    assert payload["error_type"] == "not_found"
+
+
+async def test_delegate_fan_out_cap_returns_busy(monkeypatch):
+    """Several parallel delegate_task calls beyond max_parallel_per_parent
+    get a busy result instead of an unbounded pile of concurrent sub-runs."""
+    store = MemoryStore()
+    registry = delegate_registry()
+    config = AgentConfig(credentials=ProviderCredentials(provider="openai", api_key="fake"))
+    agents = {"worker": FakeAgentSpec(content="worker")}
+
+    configure_delegate(
+        DelegateContext(
+            resolve_agent=lambda n: agents.get(n),
+            store=store,
+            config=config,
+            registry=registry,
+            max_parallel_per_parent=1,
+            queue_timeout=0.05,
+        )
+    )
+
+    from astra.providers.openai_api import OpenAIProvider
+    import asyncio
+
+    async def slow_sub_agent(self, messages, tools=None, on_token=None, on_reasoning=None):
+        await asyncio.sleep(0.3)
+        return {"role": "assistant", "content": "done", "model": "fake"}, None
+
+    monkeypatch.setattr(OpenAIProvider, "generate", slow_sub_agent)
+
+    parent_provider = FakeProvider(
+        [
+            tool_turn(
+                ("c1", "delegate_task", {"agent_name": "worker", "task": "a"}),
+                ("c2", "delegate_task", {"agent_name": "worker", "task": "b"}),
+            ),
+            text_turn("ok"),
+        ]
+    )
+    conv = Conversation(store=store, user="alice")
+    agent = Agent(conversation=conv, provider=parent_provider, registry=registry)
+    await conv.add_user_message("go")
+    result = await agent.run()
+
+    assert result.status == "done"
+    results = [json.loads(tc.result or tc.error) for tc in conv.session.tool_calls]
+    error_types = {r.get("error_type") for r in results if "error" in r}
+    assert "busy" in error_types  # one of the two was capped
+
+
+async def test_spawn_and_await_background_agent(monkeypatch):
+    store = MemoryStore()
+    registry = delegate_registry()
+    config = AgentConfig(credentials=ProviderCredentials(provider="openai", api_key="fake"))
+    agents = {"worker": FakeAgentSpec(content="worker")}
+    configure_delegate(DelegateContext(resolve_agent=lambda n: agents.get(n), store=store, config=config, registry=registry))
+
+    from astra.providers.openai_api import OpenAIProvider
+
+    async def sub_agent_generate(self, messages, tools=None, on_token=None, on_reasoning=None):
+        return {"role": "assistant", "content": "background result", "model": "fake"}, None
+
+    monkeypatch.setattr(OpenAIProvider, "generate", sub_agent_generate)
+
+    from astra.tools.delegate_tools.delegate import spawn_agent, await_agents
+    from astra.tools.core import ToolContext
+    from astra.agent.conversation import current_session_id
+
+    conv = Conversation(store=store, user="alice")
+    token = current_session_id.set(conv.session_id)
+    try:
+        raw = await spawn_agent({"agent_name": "worker", "task": "background work"}, ToolContext(conversation=conv))
+        spawned = json.loads(raw)
+        assert spawned["status"] == "running"
+        task_id = spawned["task_id"]
+
+        raw2 = await await_agents({"task_ids": [task_id], "timeout_seconds": 5}, ToolContext(conversation=conv))
+        collected = json.loads(raw2)["results"][0]
+        assert collected["status"] == "done"
+        assert collected["response"] == "background result"
+    finally:
+        current_session_id.reset(token)
+
+
+async def test_max_depth_respected_in_new_delegate():
+    """Depth limit still enforced (regression guard for the rewrite)."""
+    store = MemoryStore()
+    registry = delegate_registry()
+    config = AgentConfig(credentials=ProviderCredentials(provider="openai", api_key="fake"))
+    agents = {"loopy": FakeAgentSpec(content="loops forever")}
+    configure_delegate(DelegateContext(resolve_agent=lambda n: agents.get(n), store=store, config=config, registry=registry))
+
+    from astra.agent.conversation import current_delegate_depth
+
+    token = current_delegate_depth.set(MAX_DELEGATE_DEPTH)
+    try:
+        from astra.tools.delegate_tools.delegate import delegate_task
+        from astra.tools.core import ToolContext
+        from astra.agent.conversation import current_session_id
+
+        stoken = current_session_id.set("parent-sess")
+        try:
+            raw = await delegate_task({"agent_name": "loopy", "task": "x"}, ToolContext())
+            payload = json.loads(raw)
+            assert payload["error_type"] == "max_depth_exceeded"
+        finally:
+            current_session_id.reset(stoken)
+    finally:
+        current_delegate_depth.reset(token)

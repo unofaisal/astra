@@ -1,0 +1,62 @@
+/*
+ * THEME TOKENS — the single file to edit to reskin the whole app.
+ *
+ * Every color in the UI is a Tailwind utility (bg-surface-1, text-accent,
+ * border-attention, ...) that resolves to one of these CSS custom
+ * properties via tailwind.config.js — nothing in components/*.jsx has a
+ * hardcoded hex value. To retheme: edit the values below (and/or add a
+ * second `[data-theme="..."]` block and toggle the attribute on <html>
+ * at runtime) — no component code needs to change either way.
+ *
+ * Values are "R G B" triplets (no commas, no rgb()) so Tailwind's
+ * `rgb(var(--x) / <alpha-value>)` pattern can apply opacity modifiers
+ * (e.g. bg-accent/20) the same way built-in Tailwind colors do.
+ *
+ * Design concept: "instrument panel", not a cute assistant — a cold,
+ * near-black surface system; ONE interactive accent (indigo-violet)
+ * used only for actionable elements, never decoration; a SEPARATE
+ * amber "attention" color reserved specifically for clarification /
+ * needs-input states, so accent and attention never compete for
+ * meaning. Status is always icon + text + color together — never
+ * color alone.
+ */
+
+:root {
+  /* ── Surfaces (darkest to lightest) ───────────────────────────── */
+  --color-bg: 10 13 18; /* #0A0D12 app background */
+  --color-surface-1: 16 20 27; /* #10141B sidebar / panels */
+  --color-surface-2: 22 27 36; /* #161B24 cards, composer */
+  --color-surface-3: 30 36 47; /* #1E242F hover states */
+  --color-border: 39 46 59; /* #272E3B hairline borders */
+  --color-border-strong: 55 64 80;
+
+  /* ── Text ──────────────────────────────────────────────────────── */
+  --color-text-primary: 228 231 238; /* #E4E7EE */
+  --color-text-secondary: 154 163 181; /* #9AA3B5 */
+  --color-text-tertiary: 100 109 128; /* #646D80 */
+  --color-text-on-accent: 255 255 255;
+
+  /* ── Accent (interactive only — links, active states, send button) */
+  --color-accent: 121 135 246; /* #7987F6 indigo-violet */
+  --color-accent-hover: 141 154 248;
+  --color-accent-soft: 121 135 246; /* used at low alpha for tints, e.g. bg-accent-soft/10 */
+
+  /* ── Attention (clarification / needs-input — NEVER reused for accent) */
+  --color-attention: 217 165 68; /* #D9A544 amber */
+  --color-attention-soft: 217 165 68;
+  --color-attention-fg: 30 22 6;
+
+  /* ── Status ────────────────────────────────────────────────────── */
+  --color-success: 92 191 133; /* #5CBF85 */
+  --color-error: 235 105 105; /* #EB6969 */
+  --color-warning: 217 165 68; /* reuses attention amber — same meaning family */
+
+  /* ── Typography ────────────────────────────────────────────────── */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* ── Shape ─────────────────────────────────────────────────────── */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}
